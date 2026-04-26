@@ -8,12 +8,15 @@ Supports Xbox 360 mode and Dolphin named pipe mode.
 """
 
 import errno
+import logging
 import threading
 from typing import Optional, Dict
 
 from .virtual_gamepad import VirtualGamepad, create_gamepad
 from .controller_constants import BUTTON_MAPPING
 from .calibration import CalibrationManager
+
+logger = logging.getLogger(__name__)
 
 
 class EmulationManager:
@@ -24,12 +27,15 @@ class EmulationManager:
         self.gamepad: Optional[VirtualGamepad] = None
         self.is_emulating = False
         self.mode: str = 'xbox360'
+        self._prev_buttons: Dict[str, bool] = {}
 
     def start(self, mode: str = 'xbox360', slot_index: int = 0,
               cancel_event: threading.Event | None = None,
               rumble_callback=None) -> None:
         """Create the virtual gamepad and begin emulation. Raises on failure."""
         self.mode = mode
+        self._prev_buttons = {}
+        logger.info("Starting emulation: mode=%s slot=%d", mode, slot_index)
         self.gamepad = create_gamepad(mode, slot_index=slot_index,
                                      cancel_event=cancel_event)
         if rumble_callback and mode in ('xbox360', 'dsu'):
@@ -38,7 +44,9 @@ class EmulationManager:
 
     def stop(self) -> None:
         """Stop emulation and destroy the virtual gamepad."""
+        logger.info("Stopping emulation (mode=%s)", self.mode)
         self.is_emulating = False
+        self._prev_buttons = {}
         if self.gamepad:
             try:
                 self.gamepad.stop_rumble_listener()
@@ -70,13 +78,15 @@ class EmulationManager:
             left_trigger_calibrated = self._cal_mgr.calibrate_trigger_fast(left_trigger, 'left')
             right_trigger_calibrated = self._cal_mgr.calibrate_trigger_fast(right_trigger, 'right')
 
-            # Update button states
+            # Only emit press/release on state changes (delta updates)
             for button_name, xbox_button in BUTTON_MAPPING.items():
                 pressed = button_states.get(button_name, False)
-                if pressed:
-                    self.gamepad.press_button(xbox_button)
-                else:
-                    self.gamepad.release_button(xbox_button)
+                if pressed != self._prev_buttons.get(button_name, False):
+                    if pressed:
+                        self.gamepad.press_button(xbox_button)
+                    else:
+                        self.gamepad.release_button(xbox_button)
+                    self._prev_buttons[button_name] = pressed
 
             # Handle shoulder buttons and triggers
             l_pressed = button_states.get('L', False)

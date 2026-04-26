@@ -10,6 +10,7 @@ No elevated privileges needed.
 """
 
 import asyncio
+import logging
 import platform
 import queue
 import re
@@ -24,6 +25,8 @@ from bleak.backends.scanner import AdvertisementData
 from .sw2_protocol import (
     LED_MAP, build_led_cmd, translate_ble_native_to_usb,
 )
+
+_logger = logging.getLogger(__name__)
 
 # Nintendo BLE manufacturer company ID (from protocol doc)
 _NINTENDO_COMPANY_ID = 0x037E
@@ -52,6 +55,7 @@ _SET_INPUT_MODE = bytearray([
 
 def _log(msg: str):
     """Debug log to stderr (visible in terminal, not in IPC pipe)."""
+    _logger.debug(msg)
     print(f"[bleak] {msg}", file=sys.stderr, flush=True)
 
 
@@ -91,6 +95,27 @@ class BleakBackend:
     async def open(self):
         """No-op — the OS BLE stack is always available in userspace."""
         pass
+
+    @staticmethod
+    def _log_connection_params(client: BleakClient, address: str):
+        """Log negotiated BLE connection parameters for latency diagnostics."""
+        parts = []
+        try:
+            parts.append(f"MTU={client.mtu_size}")
+        except Exception:
+            pass
+        if sys.platform == 'win32':
+            try:
+                from bleak.backends.winrt.client import BleakClientWinRT
+                backend = client._backend
+                if isinstance(backend, BleakClientWinRT):
+                    session = backend._session
+                    if session:
+                        status = session.session_status
+                        parts.append(f"status={status}")
+            except Exception:
+                pass
+        _log(f"  BLE connection [{address}]: {', '.join(parts) if parts else 'params not available'}")
 
     async def scan_and_connect(
         self,
@@ -230,7 +255,8 @@ class BleakBackend:
     async def scan_only(self, scan_timeout: float = 10.0) -> list[dict]:
         """Run a full BLE scan and return discovered devices.
 
-        Returns a list of dicts with keys: address, name, rssi.
+        Returns a list of dicts with keys: address, name, rssi,
+        manufacturer_data, service_uuids.
         Caches BLEDevice objects in self._last_scan for connect_device().
         """
         _log(f"scan_only: scanning for {scan_timeout}s...")
@@ -252,14 +278,67 @@ class BleakBackend:
         for addr, device in found_devices.items():
             adv = found_adv.get(addr)
             rssi = adv.rssi if adv and adv.rssi is not None else -999
+            mfg = {}
+            svc_uuids = []
+            if adv:
+                mfg = {str(cid): val.hex() for cid, val in
+                       getattr(adv, 'manufacturer_data', {}).items()}
+                svc_uuids = list(getattr(adv, 'service_uuids', []))
             result.append({
-                'address': addr,
+                'address': addr.upper(),
                 'name': device.name or '',
                 'rssi': rssi,
+                'manufacturer_data': mfg,
+                'service_uuids': svc_uuids,
             })
 
         _log(f"scan_only: found {len(result)} device(s)")
         return result
+
+    async def start_scan(self, on_device_found: Callable[[dict], None]):
+        """Start a continuous BLE scan. Calls on_device_found for each new device."""
+        await self.stop_scan()
+        self._stream_devices: dict[str, BLEDevice] = {}
+        self._stream_adv: dict[str, AdvertisementData] = {}
+        self._stream_seen: set[str] = set()
+        self._stream_callback = on_device_found
+
+        def _on_detected(device: BLEDevice, adv: AdvertisementData):
+            addr = device.address.upper()
+            self._stream_devices[addr] = device
+            self._stream_adv[addr] = adv
+            if addr not in self._stream_seen:
+                self._stream_seen.add(addr)
+                rssi = adv.rssi if adv and adv.rssi is not None else -999
+                mfg = {}
+                svc_uuids = []
+                if adv:
+                    mfg = {str(cid): val.hex() for cid, val in
+                           getattr(adv, 'manufacturer_data', {}).items()}
+                    svc_uuids = list(getattr(adv, 'service_uuids', []))
+                self._stream_callback({
+                    'address': addr,
+                    'name': device.name or '',
+                    'rssi': rssi,
+                    'manufacturer_data': mfg,
+                    'service_uuids': svc_uuids,
+                })
+
+        self._active_scanner = BleakScanner(detection_callback=_on_detected)
+        await self._active_scanner.start()
+        _log("start_scan: scanner started")
+
+    async def stop_scan(self):
+        """Stop the continuous scan and cache results for connect_device."""
+        scanner = getattr(self, '_active_scanner', None)
+        if scanner is not None:
+            try:
+                await scanner.stop()
+            except Exception:
+                pass
+            self._active_scanner = None
+            self._last_scan = dict(getattr(self, '_stream_devices', {}))
+            _log(f"stop_scan: cached {len(self._last_scan)} device(s)")
 
     async def connect_device(
         self,
@@ -275,6 +354,20 @@ class BleakBackend:
         Returns the device address on success, None on failure.
         """
         address = _normalize_address(address) or address
+
+        # Clean up any stale connection to this address
+        old_client = self._clients.pop(address, None)
+        if old_client and old_client.is_connected:
+            _log(f"connect_device: disconnecting stale session for {address}")
+            on_status("Clearing previous connection...")
+            try:
+                await old_client.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        self._write_chars.pop(address, None)
+        self._cmd_chars.pop(address, None)
+
         ble_device = self._last_scan.get(address)
 
         if not ble_device:
@@ -338,10 +431,10 @@ class BleakBackend:
         except Exception:
             pass
 
-        # Request lower connection interval on Windows 11+ for reduced input latency.
-        # Windows 10 defaults to 30-60ms intervals with no API to change them.
-        # Windows 11 (build 22000+) exposes ThroughputOptimized (~7.5-15ms).
+        # Request lower connection interval for reduced input latency.
         if sys.platform == 'win32':
+            # Windows 10 defaults to 30-60ms intervals with no API to change them.
+            # Windows 11 (build 22000+) exposes ThroughputOptimized (~7.5-15ms).
             try:
                 build_number = int(platform.version().split('.')[-1])
                 if build_number >= 22000:
@@ -355,8 +448,38 @@ class BleakBackend:
                             BluetoothLEPreferredConnectionParameters.throughput_optimized
                         )
                         _log("  Requested ThroughputOptimized connection parameters")
+                else:
+                    _log("  Windows 10 detected — cannot optimize BLE interval "
+                         "(30-60ms default, upgrade to Win11 for ~7.5-15ms)")
             except Exception as e:
                 _log(f"  Connection parameter optimization skipped: {e}")
+        elif sys.platform == 'darwin':
+            # macOS CoreBluetooth: no public API for connection parameters.
+            # CBCentralManager handles interval negotiation internally (~15-30ms
+            # typical). Log for diagnostic visibility.
+            try:
+                from bleak.backends.corebluetooth.client import BleakClientCoreBluetooth
+                backend = client._backend
+                if isinstance(backend, BleakClientCoreBluetooth):
+                    _log("  macOS: requesting low-latency connection parameters")
+                    try:
+                        cb_peripheral = backend._peripheral
+                        cb_central = backend._manager
+                        # CBCentralManager has no documented setConnectionLatency
+                        # but some macOS versions expose it via ObjC runtime.
+                        if hasattr(cb_central, 'setConnectionLatency_forPeripheral_'):
+                            cb_central.setConnectionLatency_forPeripheral_(0, cb_peripheral)
+                            _log("  macOS: set connection latency to LOW")
+                        else:
+                            _log("  macOS: setConnectionLatency not available "
+                                 "(interval managed by CoreBluetooth, typically ~15-30ms)")
+                    except Exception as e2:
+                        _log(f"  macOS: connection parameter request failed: {e2}")
+            except Exception as e:
+                _log(f"  macOS connection parameter optimization skipped: {e}")
+
+        # Log connection parameters for latency diagnostics
+        self._log_connection_params(client, address)
 
         # Discover services and find write/notify characteristics
         write_chars = []

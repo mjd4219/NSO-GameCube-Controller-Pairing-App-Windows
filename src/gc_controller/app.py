@@ -16,6 +16,7 @@ import argparse
 import base64
 import errno
 import json
+import logging
 import os
 import shutil
 import signal
@@ -23,6 +24,8 @@ import subprocess
 import sys
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 try:
     import hid
@@ -37,7 +40,38 @@ from .virtual_gamepad import (
     is_emulation_available, get_emulation_unavailable_reason, ensure_dolphin_pipe,
 )
 from .controller_constants import DEFAULT_CALIBRATION, MAX_SLOTS
+from .i18n import t
 from .settings_manager import SettingsManager
+
+
+def setup_logging(debug: bool = False):
+    """Configure logging for the application.
+
+    When debug is True, sets DEBUG level and logs to both stderr and a file.
+    Otherwise, sets WARNING level (quiet by default).
+    """
+    root_logger = logging.getLogger('gc_controller')
+    root_logger.setLevel(logging.DEBUG if debug else logging.WARNING)
+
+    fmt = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(fmt)
+    root_logger.addHandler(stderr_handler)
+
+    if debug:
+        try:
+            log_dir = _get_settings_dir()
+            log_file = os.path.join(log_dir, 'gc_controller_debug.log')
+            file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+            file_handler.setFormatter(fmt)
+            root_logger.addHandler(file_handler)
+            print(f"Debug log: {log_file}", file=sys.stderr)
+        except Exception:
+            pass
 
 
 def _get_settings_dir() -> str:
@@ -98,7 +132,7 @@ if sys.platform in ('darwin', 'linux'):
 class GCControllerEnabler:
     """Main application orchestrator for NSO GameCube Controller Pairing App"""
 
-    def __init__(self):
+    def __init__(self, start_minimized: bool = False):
         import tkinter as tk
         from tkinter import messagebox
         import customtkinter
@@ -126,6 +160,13 @@ class GCControllerEnabler:
         if 'known_ble_devices' not in self.slot_calibrations[0]:
             self.slot_calibrations[0]['known_ble_devices'] = {}
 
+        # Propagate per-slot global settings from slot 0 to all other slots
+        for key in ('trigger_bump_100_percent', 'emulation_mode', 'stick_deadzone'):
+            val = self.slot_calibrations[0].get(key)
+            if val is not None:
+                for i in range(1, MAX_SLOTS):
+                    self.slot_calibrations[i][key] = val
+
         # Create slots (each with own managers)
         self.slots: list[ControllerSlot] = []
         for i in range(MAX_SLOTS):
@@ -146,6 +187,7 @@ class GCControllerEnabler:
         # No Tk interaction from background threads; the main-thread timer
         # reads these at a fixed rate (~30 fps) so updates are naturally coalesced.
         self._latest_ui_data = [None] * MAX_SLOTS
+        self._trigger_cal_live_timers: dict[int, str | None] = {}
 
         # BLE state (lazy-initialized on first pair via privileged subprocess)
         self._ble_available = is_ble_available()
@@ -156,6 +198,7 @@ class GCControllerEnabler:
         self._ble_init_result = None
         self._ble_pair_mode = {}  # slot_index -> 'pair' | 'reconnect' | 'autoscan'
         self._diff_scan_callback = {}  # slot_index -> completion callback
+        self._scan_stream_callback: dict[int, callable] = {}
         self._ble_known_scan_slot = None  # slot being scanned for known-addr matching
 
         # Auto-scan state
@@ -177,6 +220,7 @@ class GCControllerEnabler:
             on_cal_wizard=self.calibration_wizard_step,
             on_save=self.save_settings,
             on_pair=self.pair_controller if self._ble_available else None,
+            on_cal_cancel=self.cancel_calibration,
             on_emulate_all=self.toggle_emulation_all,
             on_test_rumble_all=self.test_rumble_all,
             ble_available=self._ble_available,
@@ -199,6 +243,7 @@ class GCControllerEnabler:
 
         # System tray support
         self._tray_icon = None
+        self._start_minimized = start_minimized
         if _TRAY_AVAILABLE:
             self._init_tray_icon()
             # Intercept minimize to go to tray when enabled
@@ -223,11 +268,13 @@ class GCControllerEnabler:
         sui = self.ui.slots[slot_index]
 
         if slot.is_connected:
+            logger.info("Slot %d: disconnecting (toggle)", slot_index)
             self.disconnect_controller(slot_index)
             return
 
         # Enumerate available HID devices
         all_hid = ConnectionManager.enumerate_devices()
+        logger.debug("Slot %d: found %d HID device(s)", slot_index, len(all_hid))
 
         # Filter out paths already claimed by other slots
         claimed_paths = set()
@@ -238,7 +285,7 @@ class GCControllerEnabler:
         # Auto — pick first unclaimed
         available = [d for d in all_hid if d['path'] not in claimed_paths]
         if not available:
-            self.ui.update_status(slot_index, "No unclaimed controllers found")
+            self.ui.update_status(slot_index, t("ui.no_unclaimed"))
             return
         target_path = available[0]['path']
 
@@ -265,9 +312,8 @@ class GCControllerEnabler:
         self.ui.update_tab_status(slot_index, connected=True, emulating=False)
         self.toggle_emulation(slot_index)
 
-        # Auto-start calibration wizard for uncalibrated controllers
         if self._needs_calibration(slot_index):
-            self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
+            self.ui.update_status(slot_index, t("ui.new_controller_cal"))
 
     def _reset_rumble(self, slot_index: int):
         """Send rumble OFF if currently ON and reset rumble state."""
@@ -291,6 +337,12 @@ class GCControllerEnabler:
         slot = self.slots[slot_index]
         sui = self.ui.slots[slot_index]
 
+        # Stop live trigger display and cancel in-progress calibration
+        self._stop_trigger_cal_live(slot_index)
+        slot.cal_mgr.trigger_cal_cancel()
+        self._show_cal_cancel(slot_index, False)
+        sui.cal_wizard_btn.configure(text=t("ui.cal_wizard"))
+
         # If BLE-connected, use BLE disconnect path
         if slot.ble_connected:
             self._disconnect_ble(slot_index)
@@ -305,7 +357,7 @@ class GCControllerEnabler:
         sui.connect_btn.configure(text="Connect USB")
         if sui.pair_btn:
             sui.pair_btn.configure(state='normal')
-        self.ui.update_status(slot_index, "Ready to Connect")
+        self.ui.update_status(slot_index, t("ui.ready"))
         self.ui.reset_slot_ui(slot_index)
         self.ui.update_tab_status(slot_index, connected=False, emulating=False)
 
@@ -327,8 +379,6 @@ class GCControllerEnabler:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
             )
         else:
             if frozen:
@@ -343,8 +393,6 @@ class GCControllerEnabler:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
             )
 
         self._ble_reader_thread = threading.Thread(
@@ -356,7 +404,7 @@ class GCControllerEnabler:
         if self._ble_subprocess and self._ble_subprocess.poll() is None:
             try:
                 line = json.dumps(cmd, separators=(',', ':')) + '\n'
-                self._ble_subprocess.stdin.write(line)
+                self._ble_subprocess.stdin.write(line.encode('utf-8'))
                 self._ble_subprocess.stdin.flush()
             except Exception:
                 pass
@@ -395,10 +443,29 @@ class GCControllerEnabler:
         self._ble_initialized = False
 
     def _ble_event_reader(self):
-        """Read events from the BLE subprocess stdout (runs in a thread)."""
+        """Read events from the BLE subprocess stdout (runs in a thread).
+
+        Handles two formats on the binary stdout stream:
+        - Binary data packets: 0xFF + slot(1) + payload(64) = 66 bytes
+        - JSON text lines: UTF-8 encoded, terminated by newline
+        """
         try:
-            for line in self._ble_subprocess.stdout:
-                line = line.strip()
+            stdout = self._ble_subprocess.stdout
+            while True:
+                header = stdout.read(1)
+                if not header:
+                    break
+                if header[0] == 0xFF:
+                    packet = stdout.read(65)
+                    if len(packet) < 65:
+                        break
+                    si = packet[0]
+                    if 0 <= si < len(self.slots):
+                        self.slots[si].ble_data_queue.put(packet[1:65])
+                    continue
+
+                rest = stdout.readline()
+                line = (header + rest).decode('utf-8', errors='replace').strip()
                 if not line:
                     continue
                 try:
@@ -408,22 +475,12 @@ class GCControllerEnabler:
 
                 etype = event.get('e')
 
-                # Init-phase events: signal the main thread directly
                 if not self._ble_initialized and etype in (
                         'ready', 'bluez_stopped', 'open_ok', 'error'):
                     self._ble_init_result = event
                     self._ble_init_event.set()
                     continue
 
-                # Data events: put directly into slot queue (low latency)
-                if etype == 'data':
-                    si = event.get('s')
-                    if si is not None and 0 <= si < len(self.slots):
-                        data = base64.b64decode(event['d'])
-                        self.slots[si].ble_data_queue.put(data)
-                    continue
-
-                # Other runtime events: dispatch to main (Tkinter) thread
                 self.root.after(
                     0, lambda ev=event: self._handle_ble_event(ev))
         except Exception:
@@ -442,6 +499,8 @@ class GCControllerEnabler:
         elif etype == 'connected' and si is not None:
             mac = event.get('mac')
             mode = self._ble_pair_mode.pop(si, 'pair')
+            logger.info("BLE connected: slot=%d  mac=%s  mode=%s",
+                        si, mac, mode)
             if mode == 'autoscan':
                 self._on_auto_scan_connected(si, mac)
             elif mode == 'pair':
@@ -452,6 +511,8 @@ class GCControllerEnabler:
         elif etype == 'connect_error' and si is not None:
             msg = event.get('msg', 'Connection failed')
             mode = self._ble_pair_mode.pop(si, 'pair')
+            logger.info("BLE connect_error: slot=%d  mode=%s  error=%s",
+                        si, mode, msg)
             if mode == 'autoscan':
                 self._on_auto_scan_failed(si, msg)
             elif mode == 'pair':
@@ -463,7 +524,13 @@ class GCControllerEnabler:
         elif etype == 'devices_found' and si is not None:
             self._on_devices_found(si, event.get('devices', []))
 
+        elif etype == 'device_detected' and si is not None:
+            cb = self._scan_stream_callback.get(si)
+            if cb:
+                cb(event.get('device', {}))
+
         elif etype == 'disconnected' and si is not None:
+            logger.info("BLE disconnected: slot=%d", si)
             self._on_ble_disconnect(si)
 
         elif etype == 'error':
@@ -620,6 +687,7 @@ class GCControllerEnabler:
         Always fills the first available slot regardless of which tab's button
         was clicked. If the clicked slot is BLE-connected, disconnects it instead.
         """
+        logger.info("Slot %d: initiating BLE pairing", slot_index)
         slot = self.slots[slot_index]
 
         # If already BLE-connected on this slot, disconnect
@@ -634,7 +702,7 @@ class GCControllerEnabler:
                 target_slot = i
                 break
         if target_slot is None:
-            self.ui.update_status(slot_index, "No free slots available")
+            self.ui.update_status(slot_index, t("ui.no_free_slots"))
             return
         slot_index = target_slot
         slot = self.slots[slot_index]
@@ -655,7 +723,7 @@ class GCControllerEnabler:
         # Disable pair button during pairing
         if sui.pair_btn:
             sui.pair_btn.configure(state='disabled')
-        self.ui.update_ble_status(slot_index, "Initializing...")
+        self.ui.update_ble_status(slot_index, t("ble.initializing"))
 
         # Drain any stale data from the queue
         while not slot.ble_data_queue.empty():
@@ -670,9 +738,9 @@ class GCControllerEnabler:
             if s.ble_connected and s.ble_address:
                 exclude.append(s.ble_address.upper())
 
-        # macOS/Windows: launch wizard to discover a new controller
+        # macOS/Windows: launch scan dialog to discover a new controller
         if sys.platform != 'linux':
-            self._show_diff_scan_wizard(slot_index)
+            self._show_controller_scan(slot_index, exclude)
             return
 
         # Linux: scan_connect without target (auto-identify via handshake)
@@ -692,6 +760,13 @@ class GCControllerEnabler:
         - Known-address matching logic (if scanning for known addresses)
         - Original picker dialog (fallback)
         """
+        logger.debug("Slot %d: devices_found — %d device(s)", slot_index, len(devices))
+        for d in devices:
+            logger.debug("  %s  name=%r  rssi=%s  mfg=%s  svc=%s",
+                         d.get('address'), d.get('name'), d.get('rssi'),
+                         d.get('manufacturer_data', {}),
+                         d.get('service_uuids', []))
+
         # Route to wizard completion callback if one is active
         cb = self._diff_scan_callback.pop(slot_index, None)
         if cb is not None:
@@ -710,7 +785,7 @@ class GCControllerEnabler:
         sui = self.ui.slots[slot_index]
 
         if not devices:
-            self.ui.update_ble_status(slot_index, "No devices found")
+            self.ui.update_ble_status(slot_index, t("ble.no_devices"))
             if sui.pair_btn:
                 sui.pair_btn.configure(state='normal')
             return
@@ -720,13 +795,13 @@ class GCControllerEnabler:
 
         if not chosen_address:
             # User cancelled
-            self.ui.update_ble_status(slot_index, "Pairing cancelled")
+            self.ui.update_ble_status(slot_index, t("ble.pairing_cancelled"))
             if sui.pair_btn:
                 sui.pair_btn.configure(state='normal')
             return
 
         # Send connect_device with the chosen address
-        self.ui.update_ble_status(slot_index, "Connecting...")
+        self.ui.update_ble_status(slot_index, t("ble.connecting"))
         self._ble_pair_mode[slot_index] = 'pair'
         self._send_ble_cmd({
             "cmd": "connect_device",
@@ -753,16 +828,15 @@ class GCControllerEnabler:
             slot.input_proc.start(mode='ble')
 
             if sui.pair_btn:
-                sui.pair_btn.configure(text="Disconnect", state='normal')
+                sui.pair_btn.configure(text=t("btn.disconnect"), state='normal')
             sui.connect_btn.configure(state='disabled')
-            self.ui.update_ble_status(slot_index, f"Connected: {mac}")
-            self.ui.update_status(slot_index, "Connected via BLE")
+            self.ui.update_ble_status(slot_index, t("ble.connected", mac=mac))
+            if self._needs_calibration(slot_index):
+                self.ui.update_status(slot_index, t("ui.new_controller_cal"))
+            else:
+                self.ui.update_status(slot_index, t("ui.connected_ble"))
             self.ui.update_tab_status(slot_index, connected=True, emulating=False)
             self.toggle_emulation(slot_index)
-
-            # Auto-start calibration wizard for uncalibrated controllers
-            if self._needs_calibration(slot_index):
-                self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
 
             # Ensure auto-scan is running after successful pair
             if not self._auto_scan_active and self._ble_initialized:
@@ -771,7 +845,7 @@ class GCControllerEnabler:
             if sui.pair_btn:
                 sui.pair_btn.configure(state='normal')
             if error:
-                self.ui.update_ble_status(slot_index, f"Error: {error}")
+                self.ui.update_ble_status(slot_index, t("ble.error", error=error))
             # Status was already set by on_status callback
 
     def _get_known_ble_devices(self) -> dict:
@@ -840,7 +914,7 @@ class GCControllerEnabler:
     def _try_known_addresses_scan(self, slot_index: int):
         """Scan once and check if any known address is advertising."""
         self._ble_known_scan_slot = slot_index
-        self.ui.update_ble_status(slot_index, "Scanning for known controllers...")
+        self.ui.update_ble_status(slot_index, t("ble.scanning_known"))
         self._send_ble_cmd({
             "cmd": "scan_devices",
             "slot_index": slot_index,
@@ -864,37 +938,49 @@ class GCControllerEnabler:
             })
         else:
             # No known address found — fall through to wizard
-            self._show_diff_scan_wizard(slot_index)
+            self._show_controller_scan(slot_index, [])
 
-    def _show_diff_scan_wizard(self, slot_index: int):
-        """Launch the differential scan wizard."""
-        from .ui_ble_scan_wizard import BLEScanWizard
+    def _show_controller_scan(self, slot_index: int,
+                              exclude_addresses: list[str] | None = None):
+        """Launch the live-scan controller discovery dialog."""
+        from .ui_ble_scan_wizard import BLEControllerScanDialog
 
-        def on_scan(completion_cb):
-            """Wire the wizard's scan request to the BLE subprocess."""
-            self._diff_scan_callback[slot_index] = completion_cb
+        self._ble_pair_mode[slot_index] = 'wizard'
+
+        def on_start_scan():
             self._send_ble_cmd({
-                "cmd": "scan_devices",
+                "cmd": "scan_start",
                 "slot_index": slot_index,
             })
 
-        wizard = BLEScanWizard(self.root, on_scan=on_scan)
-        chosen_address = wizard.show()
+        def on_stop_scan():
+            self._scan_stream_callback.pop(slot_index, None)
+            self._send_ble_cmd({"cmd": "scan_stop"})
 
-        # Clean up any leftover callback
-        self._diff_scan_callback.pop(slot_index, None)
+        dialog = BLEControllerScanDialog(
+            self.root,
+            on_start_scan=on_start_scan,
+            on_stop_scan=on_stop_scan,
+            exclude_addresses=set(exclude_addresses or ()))
+
+        self._scan_stream_callback[slot_index] = dialog.add_device
+
+        chosen_address = dialog.show()
+
+        self._scan_stream_callback.pop(slot_index, None)
 
         sui = self.ui.slots[slot_index]
 
         if not chosen_address:
-            # Wizard cancelled
-            self.ui.update_ble_status(slot_index, "Pairing cancelled")
+            self._ble_pair_mode.pop(slot_index, None)
+            self.ui.update_ble_status(slot_index, t("ble.pairing_cancelled"))
             if sui.pair_btn:
                 sui.pair_btn.configure(state='normal')
             return
 
-        # Connect to the chosen device
-        self.ui.update_ble_status(slot_index, "Connecting...")
+        logger.info("Slot %d: user selected %s — connecting...",
+                     slot_index, chosen_address)
+        self.ui.update_ble_status(slot_index, t("ble.connecting"))
         self._ble_pair_mode[slot_index] = 'pair'
         self._send_ble_cmd({
             "cmd": "connect_device",
@@ -1065,10 +1151,10 @@ class GCControllerEnabler:
         slot.input_proc.start(mode='ble')
 
         if sui.pair_btn:
-            sui.pair_btn.configure(text="Disconnect", state='normal')
+            sui.pair_btn.configure(text=t("btn.disconnect"), state='normal')
         sui.connect_btn.configure(state='disabled')
-        self.ui.update_status(slot_index, "Auto-connected via BLE")
-        self.ui.update_ble_status(slot_index, f"Connected: {mac}")
+        self.ui.update_status(slot_index, t("ui.auto_connected_ble"))
+        self.ui.update_ble_status(slot_index, t("ble.connected", mac=mac))
         self.ui.update_tab_status(
             slot_index, connected=True, emulating=False)
         self.toggle_emulation(slot_index)
@@ -1129,9 +1215,9 @@ class GCControllerEnabler:
         self._ble_pair_mode.pop(slot_index, None)
 
         if sui.pair_btn:
-            sui.pair_btn.configure(text="Pair New Controller", state='normal')
+            sui.pair_btn.configure(text=t("ui.pair_wireless"), state='normal')
         sui.connect_btn.configure(state='normal')
-        self.ui.update_status(slot_index, "Ready to Connect")
+        self.ui.update_status(slot_index, t("ui.ready"))
         self.ui.reset_slot_ui(slot_index)
         self.ui.update_tab_status(slot_index, connected=False, emulating=False)
 
@@ -1159,8 +1245,8 @@ class GCControllerEnabler:
 
         sui = self.ui.slots[slot_index]
 
-        self.ui.update_status(slot_index, "BLE disconnected — reconnecting...")
-        self.ui.update_ble_status(slot_index, "Reconnecting...")
+        self.ui.update_status(slot_index, t("ui.ble_disconnected_reconnecting"))
+        self.ui.update_ble_status(slot_index, t("ble.reconnecting"))
         if sui.pair_btn:
             sui.pair_btn.configure(state='disabled')
         self.ui.update_tab_status(slot_index, connected=False, emulating=False)
@@ -1176,7 +1262,7 @@ class GCControllerEnabler:
 
         # User clicked disconnect while we were waiting — abort
         if slot.input_proc.stop_event.is_set():
-            self.ui.update_status(slot_index, "Ready to Connect")
+            self.ui.update_status(slot_index, t("ui.ready"))
             self.ui.update_ble_status(slot_index, "")
             self.ui.reset_slot_ui(slot_index)
             if self.ui.slots[slot_index].pair_btn:
@@ -1222,10 +1308,10 @@ class GCControllerEnabler:
 
         sui = self.ui.slots[slot_index]
         if sui.pair_btn:
-            sui.pair_btn.configure(text="Disconnect", state='normal')
+            sui.pair_btn.configure(text=t("btn.disconnect"), state='normal')
         sui.connect_btn.configure(state='disabled')
-        self.ui.update_status(slot_index, "Reconnected via BLE")
-        self.ui.update_ble_status(slot_index, f"Connected: {mac}")
+        self.ui.update_status(slot_index, t("ble.reconnected"))
+        self.ui.update_ble_status(slot_index, t("ble.connected", mac=mac))
         self.ui.update_tab_status(slot_index, connected=True, emulating=False)
 
         if slot.reconnect_was_emulating:
@@ -1318,7 +1404,7 @@ class GCControllerEnabler:
         if slot.emu_mgr.is_emulating:
             slot.emu_mgr.stop()
 
-        self.ui.update_status(slot_index, "Controller disconnected — reconnecting...")
+        self.ui.update_status(slot_index, t("ui.disconnected_reconnecting"))
         sui.connect_btn.configure(text="Connect USB")
         if sui.pair_btn:
             sui.pair_btn.configure(state='normal')
@@ -1333,7 +1419,7 @@ class GCControllerEnabler:
 
         # User clicked Disconnect while we were waiting — abort.
         if slot.input_proc.stop_event.is_set():
-            self.ui.update_status(slot_index, "Ready to Connect")
+            self.ui.update_status(slot_index, t("ui.ready"))
             self.ui.reset_slot_ui(slot_index)
             self.ui.update_tab_status(slot_index, connected=False, emulating=False)
             return
@@ -1381,7 +1467,7 @@ class GCControllerEnabler:
                 sui.connect_btn.configure(text="Disconnect USB")
                 if sui.pair_btn:
                     sui.pair_btn.configure(state='disabled')
-                self.ui.update_status(slot_index, "Reconnected")
+                self.ui.update_status(slot_index, t("ui.reconnected"))
                 self.ui.update_tab_status(slot_index, connected=True, emulating=False)
 
                 if slot.reconnect_was_emulating:
@@ -1390,7 +1476,7 @@ class GCControllerEnabler:
                 return
 
         # Failed — retry after a delay
-        self.ui.update_status(slot_index, "Controller disconnected — reconnecting...")
+        self.ui.update_status(slot_index, t("ui.disconnected_reconnecting"))
         self.root.after(2000, lambda: self._attempt_reconnect(slot_index))
 
     # ── Emulation ────────────────────────────────────────────────────
@@ -1585,56 +1671,125 @@ class GCControllerEnabler:
         """Check if a slot has default (uncalibrated) stick calibration."""
         return self.slot_calibrations[slot_index].get('stick_left_octagon') is None
 
-    def _start_auto_calibration(self, slot_index: int):
-        """Start the calibration wizard automatically for a newly connected controller."""
-        if not self.slots[slot_index].is_connected:
-            return
-        # Wait until the controller is actually producing HID data before starting
-        if self._latest_ui_data[slot_index] is None:
-            self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
-            return
-        self.ui.update_status(slot_index, "New controller — starting calibration...")
-        self.calibration_wizard_step(slot_index)
-
     def calibration_wizard_step(self, slot_index: int):
         """Unified calibration wizard: sticks first, then triggers, one button."""
         slot = self.slots[slot_index]
         sui = self.ui.slots[slot_index]
+        logger.debug("Slot %d: calibration_wizard_step (stick_cal=%s, trigger_step=%d)",
+                      slot_index, slot.cal_mgr.stick_calibrating, slot.cal_mgr.trigger_cal_step)
 
         if slot.cal_mgr.stick_calibrating:
-            # Finish stick calibration, chain into trigger calibration
             slot.cal_mgr.finish_stick_calibration()
             self.ui.set_calibration_mode(slot_index, False)
             self.ui.redraw_octagons(slot_index)
             self._auto_save()
 
-            # Start trigger calibration (step 0 → 1)
             result = slot.cal_mgr.trigger_cal_next_step()
             if result:
                 _step, _btn, status_text = result
-                sui.cal_wizard_btn.configure(text="Continue")
+                sui.cal_wizard_btn.configure(text=t("btn.continue"))
                 self.ui.update_status(slot_index, status_text)
+                self._show_cal_cancel(slot_index, True)
+                self._start_trigger_cal_live(slot_index)
 
         elif slot.cal_mgr.trigger_cal_step > 0:
-            # Advance trigger calibration wizard
             result = slot.cal_mgr.trigger_cal_next_step()
             if result:
-                step, _btn, status_text = result
+                step, btn_text, status_text = result
                 self.ui.update_status(slot_index, status_text)
                 if step == 0:
-                    # Wizard complete
-                    sui.cal_wizard_btn.configure(text="Calibration Wizard")
+                    self._stop_trigger_cal_live(slot_index)
+                    self._show_cal_cancel(slot_index, False)
+                    sui.cal_wizard_btn.configure(text=t("ui.cal_wizard"))
                     self.ui.draw_trigger_markers(slot_index)
                     self._auto_save()
                 else:
-                    sui.cal_wizard_btn.configure(text="Continue")
+                    sui.cal_wizard_btn.configure(text=btn_text)
 
         else:
-            # Start stick calibration (phase 1)
-            self.ui.set_calibration_mode(slot_index, True)
-            slot.cal_mgr.start_stick_calibration()
-            sui.cal_wizard_btn.configure(text="Continue")
-            self.ui.update_status(slot_index, "Move sticks to all extremes, then click Continue")
+            if self._needs_calibration(slot_index):
+                self.ui.set_calibration_mode(slot_index, True)
+                slot.cal_mgr.start_stick_calibration()
+                sui.cal_wizard_btn.configure(text=t("btn.continue"))
+                self._show_cal_cancel(slot_index, True)
+                self.ui.update_status(slot_index, t("cal.sticks_instruction"))
+            else:
+                result = slot.cal_mgr.trigger_cal_next_step()
+                if result:
+                    _step, _btn, status_text = result
+                    sui.cal_wizard_btn.configure(text=t("btn.continue"))
+                    self.ui.update_status(slot_index, status_text)
+                    self._show_cal_cancel(slot_index, True)
+                    self._start_trigger_cal_live(slot_index)
+
+    def cancel_calibration(self, slot_index: int):
+        """Cancel any in-progress calibration (sticks or triggers)."""
+        slot = self.slots[slot_index]
+        sui = self.ui.slots[slot_index]
+        logger.info("Slot %d: calibration cancelled by user", slot_index)
+
+        if slot.cal_mgr.stick_calibrating:
+            slot.cal_mgr.stick_calibrating = False
+            self.ui.set_calibration_mode(slot_index, False)
+            self.ui.redraw_octagons(slot_index)
+
+        if slot.cal_mgr.trigger_cal_step > 0:
+            slot.cal_mgr.trigger_cal_cancel()
+            self._stop_trigger_cal_live(slot_index)
+            self.ui.draw_trigger_markers(slot_index)
+
+        self._show_cal_cancel(slot_index, False)
+        sui.cal_wizard_btn.configure(text=t("ui.cal_wizard"))
+        self.ui.update_status(slot_index, t("ui.ready"))
+
+    def _show_cal_cancel(self, slot_index: int, show: bool):
+        """Show or hide the calibration cancel button."""
+        sui = self.ui.slots[slot_index]
+        if sui.cal_cancel_btn is None:
+            return
+        if show:
+            if not sui.cal_cancel_btn.winfo_ismapped():
+                sui.cal_cancel_btn.pack(side=self._tk.LEFT, padx=(4, 0))
+        else:
+            sui.cal_cancel_btn.pack_forget()
+
+    def _start_trigger_cal_live(self, slot_index: int):
+        """Start periodic display of live trigger values during calibration."""
+        self._stop_trigger_cal_live(slot_index)
+
+        _STEP_KEYS = {
+            1: "cal.trigger_release",
+            2: "cal.trigger_left_bump",
+            3: "cal.trigger_left_max",
+            4: "cal.trigger_right_bump",
+            5: "cal.trigger_right_max",
+        }
+
+        def _tick():
+            slot = self.slots[slot_index]
+            step = slot.cal_mgr.trigger_cal_step
+            if step == 0 or not slot.is_connected:
+                self._trigger_cal_live_timers.pop(slot_index, None)
+                return
+            left = slot.cal_mgr.trigger_cal_last_left
+            right = slot.cal_mgr.trigger_cal_last_right
+            peak_l = slot.cal_mgr.trigger_cal_peak_left
+            peak_r = slot.cal_mgr.trigger_cal_peak_right
+            key = _STEP_KEYS.get(step, "")
+            instruction = t(key) if key else ""
+            self.ui.update_status(
+                slot_index,
+                f"{instruction}\nL={left} (max={peak_l})  R={right} (max={peak_r})")
+            self._trigger_cal_live_timers[slot_index] = self.root.after(
+                100, _tick)
+
+        _tick()
+
+    def _stop_trigger_cal_live(self, slot_index: int):
+        """Stop the live trigger value display for a slot."""
+        timer_id = self._trigger_cal_live_timers.pop(slot_index, None)
+        if timer_id is not None:
+            self.root.after_cancel(timer_id)
 
     # ── Settings ─────────────────────────────────────────────────────
 
@@ -1646,11 +1801,20 @@ class GCControllerEnabler:
         self.slot_calibrations[0]['emulation_mode'] = self.ui.emu_mode_var.get()
         self.slot_calibrations[0]['trigger_bump_100_percent'] = self.ui.trigger_mode_var.get()
         self.slot_calibrations[0]['minimize_to_tray'] = self.ui.minimize_to_tray_var.get()
+        self.slot_calibrations[0]['stick_deadzone'] = self.ui.stick_deadzone_var.get()
+        self.slot_calibrations[0]['run_at_startup'] = self.ui.run_at_startup_var.get()
+
+        from . import autostart
+        try:
+            autostart.set_enabled(self.ui.run_at_startup_var.get())
+        except Exception as e:
+            logger.warning("Failed to update autostart: %s", e)
 
         for i in range(MAX_SLOTS):
             cal = self.slot_calibrations[i]
             cal['trigger_bump_100_percent'] = self.ui.trigger_mode_var.get()
             cal['emulation_mode'] = self.ui.emu_mode_var.get()
+            cal['stick_deadzone'] = self.ui.stick_deadzone_var.get()
             self.slots[i].cal_mgr.refresh_cache()
 
             # Save per-device calibration back to the BLE device registry
@@ -1763,6 +1927,25 @@ class GCControllerEnabler:
         # Start hidden — only visible when minimize-to-tray is active
         self._tray_icon.visible = False
 
+        # Ensure tray icon is removed on any exit (Ctrl+C, SIGTERM, etc.)
+        import atexit
+        atexit.register(self._cleanup_tray)
+        if sys.platform == 'win32':
+            try:
+                signal.signal(signal.SIGBREAK, lambda *_: self._cleanup_tray())
+            except (OSError, AttributeError):
+                pass
+
+    def _cleanup_tray(self):
+        """Remove tray icon — called via atexit/signal for clean exit."""
+        icon = self._tray_icon
+        if icon is not None:
+            self._tray_icon = None
+            try:
+                icon.stop()
+            except Exception:
+                pass
+
     def _on_tray_setting_changed(self):
         """Called when the minimize_to_tray setting is toggled."""
         if not self.ui.minimize_to_tray_var.get() and self._tray_icon:
@@ -1827,12 +2010,7 @@ class GCControllerEnabler:
         self._stop_auto_scan()
 
         # Stop tray icon
-        if self._tray_icon:
-            try:
-                self._tray_icon.stop()
-            except Exception:
-                pass
-            self._tray_icon = None
+        self._cleanup_tray()
 
         for i in range(MAX_SLOTS):
             self._reset_rumble(i)
@@ -1877,6 +2055,9 @@ class GCControllerEnabler:
 
     def run(self):
         """Start the application."""
+        if self._start_minimized and _TRAY_AVAILABLE and self._tray_icon:
+            self.root.withdraw()
+            self._tray_icon.visible = True
         self.root.mainloop()
 
 
@@ -1906,8 +2087,6 @@ class _BleHeadlessManager:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
             )
         else:
             if frozen:
@@ -1922,8 +2101,6 @@ class _BleHeadlessManager:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
             )
 
     def send_cmd(self, cmd: dict):
@@ -1931,7 +2108,7 @@ class _BleHeadlessManager:
         if self._subprocess and self._subprocess.poll() is None:
             try:
                 line = json.dumps(cmd, separators=(',', ':')) + '\n'
-                self._subprocess.stdin.write(line)
+                self._subprocess.stdin.write(line.encode('utf-8'))
                 self._subprocess.stdin.flush()
             except Exception:
                 pass
@@ -2017,10 +2194,28 @@ class _BleHeadlessManager:
         self._reader_thread.start()
 
     def _event_reader(self, on_data, on_event):
-        """Read events from the BLE subprocess stdout (runs in a thread)."""
+        """Read events from the BLE subprocess stdout (runs in a thread).
+
+        Handles two formats on the binary stdout stream:
+        - Binary data packets: 0xFF + slot(1) + payload(64) = 66 bytes
+        - JSON text lines: UTF-8 encoded, terminated by newline
+        """
         try:
-            for line in self._subprocess.stdout:
-                line = line.strip()
+            stdout = self._subprocess.stdout
+            while True:
+                header = stdout.read(1)
+                if not header:
+                    break
+                if header[0] == 0xFF:
+                    packet = stdout.read(65)
+                    if len(packet) < 65:
+                        break
+                    si = packet[0]
+                    on_data(si, packet[1:65])
+                    continue
+
+                rest = stdout.readline()
+                line = (header + rest).decode('utf-8', errors='replace').strip()
                 if not line:
                     continue
                 try:
@@ -2030,22 +2225,12 @@ class _BleHeadlessManager:
 
                 etype = event.get('e')
 
-                # Init-phase events: signal the main thread directly
                 if not self._initialized and etype in (
                         'ready', 'bluez_stopped', 'open_ok', 'error'):
                     self._init_result = event
                     self._init_event.set()
                     continue
 
-                # Data events: put directly into slot queue (low latency)
-                if etype == 'data':
-                    si = event.get('s')
-                    if si is not None:
-                        data = base64.b64decode(event['d'])
-                        on_data(si, data)
-                    continue
-
-                # Other runtime events: dispatch to event queue
                 on_event(event)
         except Exception:
             pass
@@ -2628,6 +2813,92 @@ def run_headless(mode_override: str = None):
     print("Done.")
 
 
+def run_scan_debug(timeout: float = 10.0):
+    """Run a single BLE scan and dump full advertisement data for every device.
+
+    Prints a table of all discovered devices with manufacturer_data,
+    service_uuids, and whether each passes the controller detection filter.
+    No GUI or subprocess — runs Bleak directly.
+    """
+    import asyncio
+
+    try:
+        from bleak import BleakScanner
+    except ImportError:
+        print("ERROR: bleak is not installed. Install with: pip install bleak")
+        sys.exit(1)
+
+    from .ui_ble_scan_wizard import _is_likely_controller
+
+    async def _scan():
+        found = {}
+        found_adv = {}
+
+        def _cb(device, adv):
+            found[device.address] = device
+            found_adv[device.address] = adv
+
+        print(f"Scanning for {timeout}s...\n")
+        scanner = BleakScanner(detection_callback=_cb)
+        await scanner.start()
+        await asyncio.sleep(timeout)
+        await scanner.stop()
+
+        devices = []
+        for addr, device in found.items():
+            adv = found_adv.get(addr)
+            mfg = {}
+            svc_uuids = []
+            if adv:
+                mfg = {str(cid): val.hex() for cid, val in
+                       getattr(adv, 'manufacturer_data', {}).items()}
+                svc_uuids = list(getattr(adv, 'service_uuids', []))
+            devices.append({
+                'address': addr.upper(),
+                'name': device.name or '',
+                'rssi': adv.rssi if adv and adv.rssi is not None else -999,
+                'manufacturer_data': mfg,
+                'service_uuids': svc_uuids,
+            })
+
+        devices.sort(key=lambda d: d['rssi'], reverse=True)
+
+        print(f"{'#':>3}  {'Address':17}  {'RSSI':>6}  {'Ctrl?':5}  "
+              f"{'Name':25}  {'Manufacturer Data':40}  Service UUIDs")
+        print("-" * 150)
+
+        for i, d in enumerate(devices, 1):
+            is_ctrl = _is_likely_controller(d)
+            mfg_str = ""
+            for cid, val in d['manufacturer_data'].items():
+                mfg_str += f"0x{int(cid):04X}={val} "
+            svc_str = " ".join(d['service_uuids'][:3])
+            if len(d['service_uuids']) > 3:
+                svc_str += f" (+{len(d['service_uuids']) - 3})"
+            name_display = d['name'][:25] if d['name'] else '(no name)'
+            marker = " <<" if is_ctrl else ""
+
+            print(f"{i:3}  {d['address']:17}  {d['rssi']:>4} dBm  "
+                  f"{'YES' if is_ctrl else '   ':5}  "
+                  f"{name_display:25}  {mfg_str:40}  {svc_str}{marker}")
+
+        ctrl_count = sum(1 for d in devices if _is_likely_controller(d))
+        print(f"\nTotal: {len(devices)} device(s), "
+              f"{ctrl_count} identified as likely controller(s)")
+
+        if ctrl_count > 0:
+            print("\nDetected controller details:")
+            for d in devices:
+                if _is_likely_controller(d):
+                    print(f"  {d['address']}  name={d['name']!r}  rssi={d['rssi']}")
+                    for cid, val in d['manufacturer_data'].items():
+                        print(f"    manufacturer 0x{int(cid):04X}: {val}")
+                    for svc in d['service_uuids']:
+                        print(f"    service: {svc}")
+
+    asyncio.run(_scan())
+
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
@@ -2645,12 +2916,55 @@ def main():
         default=None,
         help="emulation mode for headless operation (default: use saved setting)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="enable verbose debug logging to stderr and log file",
+    )
+    parser.add_argument(
+        "--scan-debug",
+        action="store_true",
+        help="run a single BLE scan and dump full advertisement data, then exit",
+    )
+    parser.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=10.0,
+        help="scan duration in seconds for --scan-debug (default: 10)",
+    )
+    parser.add_argument(
+        "--lang",
+        choices=["en", "fr"],
+        default=None,
+        help="force UI language (default: auto-detect from system)",
+    )
+    parser.add_argument(
+        "--latency",
+        action="store_true",
+        help="print real-time latency stats to stderr (~1 line/sec per slot)",
+    )
+    parser.add_argument(
+        "--minimized",
+        action="store_true",
+        help="start minimized to the system tray (used by autostart)",
+    )
     args = parser.parse_args()
 
-    if args.headless:
+    if args.latency:
+        from .input_processor import set_latency_profiling
+        set_latency_profiling(True)
+
+    setup_logging(debug=args.debug)
+
+    from .i18n import init as i18n_init
+    i18n_init(lang=args.lang)
+
+    if args.scan_debug:
+        run_scan_debug(timeout=args.scan_timeout)
+    elif args.headless:
         run_headless(mode_override=args.mode)
     else:
-        app = GCControllerEnabler()
+        app = GCControllerEnabler(start_minimized=args.minimized)
         app.run()
 
 
