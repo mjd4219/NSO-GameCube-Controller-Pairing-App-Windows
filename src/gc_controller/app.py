@@ -13,6 +13,7 @@ Note: Windows users need ViGEmBus driver for Xbox 360 emulation
 """
 
 import argparse
+import atexit
 import base64
 import errno
 import json
@@ -26,6 +27,7 @@ import threading
 import time
 
 logger = logging.getLogger(__name__)
+_single_instance_lock = None
 
 try:
     import hid
@@ -44,14 +46,14 @@ from .i18n import t
 from .settings_manager import SettingsManager
 
 
-def setup_logging(debug: bool = False):
+def setup_logging():
     """Configure logging for the application.
 
-    When debug is True, sets DEBUG level and logs to both stderr and a file.
-    Otherwise, sets WARNING level (quiet by default).
+    Logs DEBUG and above to a file on every run while keeping stderr quiet by
+    default.
     """
     root_logger = logging.getLogger('gc_controller')
-    root_logger.setLevel(logging.DEBUG if debug else logging.WARNING)
+    root_logger.setLevel(logging.DEBUG)
 
     fmt = logging.Formatter(
         '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -59,19 +61,20 @@ def setup_logging(debug: bool = False):
     )
 
     stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
     stderr_handler.setFormatter(fmt)
     root_logger.addHandler(stderr_handler)
 
-    if debug:
-        try:
-            log_dir = _get_settings_dir()
-            log_file = os.path.join(log_dir, 'gc_controller_debug.log')
-            file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-            file_handler.setFormatter(fmt)
-            root_logger.addHandler(file_handler)
-            print(f"Debug log: {log_file}", file=sys.stderr)
-        except Exception:
-            pass
+    try:
+        log_dir = _get_settings_dir()
+        log_file = os.path.join(log_dir, 'gc_controller.log')
+        file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(fmt)
+        root_logger.addHandler(file_handler)
+        logger.info("Logging to %s", log_file)
+    except Exception:
+        pass
 
 
 def _get_settings_dir() -> str:
@@ -93,6 +96,106 @@ def _get_settings_dir() -> str:
         os.makedirs(settings_dir, exist_ok=True)
         return settings_dir
     return os.getcwd()
+
+
+class _SingleInstanceLock:
+    """Process-wide guard that prevents multiple app instances per user."""
+
+    _WINDOWS_MUTEX_NAME = "Local\\NSOGameCubeControllerPairingApp"
+
+    def __init__(self):
+        self._handle = None
+        self._lock_file = None
+
+    def acquire(self) -> bool:
+        if sys.platform == 'win32':
+            return self._acquire_windows_mutex()
+        return self._acquire_file_lock()
+
+    def release(self):
+        if sys.platform == 'win32' and self._handle:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.CloseHandle(self._handle)
+            except Exception:
+                pass
+            self._handle = None
+        elif self._lock_file:
+            try:
+                import fcntl
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                self._lock_file.close()
+            except Exception:
+                pass
+            self._lock_file = None
+
+    def _acquire_windows_mutex(self) -> bool:
+        import ctypes
+        import ctypes.wintypes
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.wintypes.LPVOID,
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.LPCWSTR,
+        )
+
+        handle = kernel32.CreateMutexW(None, False, self._WINDOWS_MUTEX_NAME)
+        if not handle:
+            return True
+        self._handle = handle
+        return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
+
+    def _acquire_file_lock(self) -> bool:
+        import fcntl
+
+        lock_path = os.path.join(_get_settings_dir(), 'gc_controller.lock')
+        lock_file = open(lock_path, 'w', encoding='utf-8')
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_file.close()
+            return False
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        self._lock_file = lock_file
+        return True
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Return False when another app instance is already running."""
+    global _single_instance_lock
+
+    lock = _SingleInstanceLock()
+    try:
+        acquired = lock.acquire()
+    except Exception as e:
+        print(f"Warning: single-instance check failed: {e}", file=sys.stderr)
+        return True
+
+    if not acquired:
+        lock.release()
+        return False
+
+    _single_instance_lock = lock
+    atexit.register(lock.release)
+    return True
+
+
+def _log_existing_instance():
+    """Record a duplicate launch without showing anything to the user."""
+    try:
+        log_file = os.path.join(_get_settings_dir(), 'gc_controller.log')
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write("Duplicate app launch ignored; another instance is already running.\n")
+    except Exception:
+        pass
 
 
 from .calibration import CalibrationManager
@@ -161,7 +264,8 @@ class GCControllerEnabler:
             self.slot_calibrations[0]['known_ble_devices'] = {}
 
         # Propagate per-slot global settings from slot 0 to all other slots
-        for key in ('trigger_bump_100_percent', 'emulation_mode', 'stick_deadzone'):
+        for key in ('trigger_bump_100_percent', 'emulation_mode',
+                    'stick_deadzone', 'zl_disconnect_enabled'):
             val = self.slot_calibrations[0].get(key)
             if val is not None:
                 for i in range(1, MAX_SLOTS):
@@ -180,6 +284,8 @@ class GCControllerEnabler:
                     0, lambda m=msg: self.ui.update_status(idx, m)),
                 on_disconnect=lambda idx=i: self.root.after(
                     0, lambda: self._on_unexpected_disconnect(idx)),
+                on_controller_disconnect_request=lambda idx=i: self.root.after(
+                    0, lambda: self.disconnect_controller(idx)),
             )
             self.slots.append(slot)
 
@@ -193,6 +299,7 @@ class GCControllerEnabler:
         self._ble_available = is_ble_available()
         self._ble_subprocess = None
         self._ble_reader_thread = None
+        self._ble_stderr_thread = None
         self._ble_initialized = False
         self._ble_init_event = threading.Event()
         self._ble_init_result = None
@@ -207,6 +314,7 @@ class GCControllerEnabler:
         self._auto_scan_pending = False   # True while a scan_connect is in-flight for auto-scan
         self._auto_scan_slot = None       # slot_index used for current auto-scan command
         self._auto_scan_addr_index = 0   # round-robin index for known address targeting
+        self._ble_manual_disconnect_until = {}
         self._ble_init_in_progress = False
 
         self._ble_init_retry_count = 0
@@ -378,7 +486,7 @@ class GCControllerEnabler:
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
         else:
             if frozen:
@@ -392,12 +500,15 @@ class GCControllerEnabler:
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
 
         self._ble_reader_thread = threading.Thread(
             target=self._ble_event_reader, daemon=True)
         self._ble_reader_thread.start()
+        self._ble_stderr_thread = threading.Thread(
+            target=self._ble_stderr_reader, daemon=True)
+        self._ble_stderr_thread.start()
 
     def _send_ble_cmd(self, cmd: dict):
         """Send a JSON-line command to the BLE subprocess."""
@@ -483,6 +594,19 @@ class GCControllerEnabler:
 
                 self.root.after(
                     0, lambda ev=event: self._handle_ble_event(ev))
+        except Exception:
+            pass
+
+    def _ble_stderr_reader(self):
+        """Forward BLE subprocess stderr into the app logger."""
+        proc = self._ble_subprocess
+        if not proc or not proc.stderr:
+            return
+        try:
+            for raw_line in iter(proc.stderr.readline, b''):
+                line = raw_line.decode('utf-8', errors='replace').rstrip()
+                if line:
+                    logger.debug("BLE subprocess: %s", line)
         except Exception:
             pass
 
@@ -819,6 +943,7 @@ class GCControllerEnabler:
             slot.ble_connected = True
             slot.ble_address = mac
             slot.connection_mode = 'ble'
+            self._ble_manual_disconnect_until.pop(mac.upper(), None)
 
             # Register device and load its calibration into this slot
             self._add_known_ble_device(mac)
@@ -1055,6 +1180,13 @@ class GCControllerEnabler:
                 10000, self._auto_scan_tick)
             return
 
+        now = time.monotonic()
+        self._ble_manual_disconnect_until = {
+            addr: until
+            for addr, until in self._ble_manual_disconnect_until.items()
+            if until > now
+        }
+
         # Build set of already-connected BLE addresses
         connected_addrs = set()
         for s in self.slots:
@@ -1062,7 +1194,11 @@ class GCControllerEnabler:
                 connected_addrs.add(s.ble_address.upper())
 
         # Check if all known controllers are already connected
-        unconnected = [a for a in known if a.upper() not in connected_addrs]
+        unconnected = [
+            a for a in known
+            if (a.upper() not in connected_addrs
+                and a.upper() not in self._ble_manual_disconnect_until)
+        ]
         if not unconnected:
             self._auto_scan_timer_id = self.root.after(
                 10000, self._auto_scan_tick)
@@ -1142,6 +1278,8 @@ class GCControllerEnabler:
         slot.ble_connected = True
         slot.ble_address = mac
         slot.connection_mode = 'ble'
+        if mac:
+            self._ble_manual_disconnect_until.pop(mac.upper(), None)
 
         # Load device's calibration into this slot
         self._add_known_ble_device(mac)
@@ -1187,6 +1325,8 @@ class GCControllerEnabler:
         # Save device calibration before disconnecting
         if slot.ble_address:
             self._save_device_calibration(slot_index, slot.ble_address)
+            self._ble_manual_disconnect_until[slot.ble_address.upper()] = (
+                time.monotonic() + 3.0)
 
         self._reset_rumble(slot_index)
         slot.input_proc.stop()
@@ -1221,7 +1361,9 @@ class GCControllerEnabler:
         self.ui.reset_slot_ui(slot_index)
         self.ui.update_tab_status(slot_index, connected=False, emulating=False)
 
-        # Reschedule auto-scan so it can reconnect this controller
+        # Reschedule auto-scan for other known controllers. The address just
+        # disconnected intentionally is suppressed until it is paired again
+        # or the app restarts.
         self._ensure_auto_scan(delay_ms=3000)
 
     def _on_ble_disconnect(self, slot_index: int):
@@ -1305,6 +1447,7 @@ class GCControllerEnabler:
         slot.ble_connected = True
         slot.ble_address = mac
         slot.input_proc.start(mode='ble')
+        self._ble_manual_disconnect_until.pop(mac.upper(), None)
 
         sui = self.ui.slots[slot_index]
         if sui.pair_btn:
@@ -1801,6 +1944,7 @@ class GCControllerEnabler:
         self.slot_calibrations[0]['emulation_mode'] = self.ui.emu_mode_var.get()
         self.slot_calibrations[0]['trigger_bump_100_percent'] = self.ui.trigger_mode_var.get()
         self.slot_calibrations[0]['minimize_to_tray'] = self.ui.minimize_to_tray_var.get()
+        self.slot_calibrations[0]['zl_disconnect_enabled'] = self.ui.zl_disconnect_var.get()
         self.slot_calibrations[0]['stick_deadzone'] = self.ui.stick_deadzone_var.get()
         self.slot_calibrations[0]['run_at_startup'] = self.ui.run_at_startup_var.get()
 
@@ -1815,6 +1959,7 @@ class GCControllerEnabler:
             cal['trigger_bump_100_percent'] = self.ui.trigger_mode_var.get()
             cal['emulation_mode'] = self.ui.emu_mode_var.get()
             cal['stick_deadzone'] = self.ui.stick_deadzone_var.get()
+            cal['zl_disconnect_enabled'] = self.ui.zl_disconnect_var.get()
             self.slots[i].cal_mgr.refresh_cache()
 
             # Save per-device calibration back to the BLE device registry
@@ -2917,11 +3062,6 @@ def main():
         help="emulation mode for headless operation (default: use saved setting)",
     )
     parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="enable verbose debug logging to stderr and log file",
-    )
-    parser.add_argument(
         "--scan-debug",
         action="store_true",
         help="run a single BLE scan and dump full advertisement data, then exit",
@@ -2954,7 +3094,11 @@ def main():
         from .input_processor import set_latency_profiling
         set_latency_profiling(True)
 
-    setup_logging(debug=args.debug)
+    if not _acquire_single_instance_lock():
+        _log_existing_instance()
+        return
+
+    setup_logging()
 
     from .i18n import init as i18n_init
     i18n_init(lang=args.lang)
